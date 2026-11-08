@@ -1,0 +1,968 @@
+#!/usr/bin/env python3
+"""gloam: an internet radio and music player for the terminal, with a
+visualiser based on the animated background of lpx.org.uk.
+
+Plays internet radio (Icecast, SHOUTcast and HLS streams, .pls and .m3u
+links) and any local audio file ffmpeg can read, and draws the background's
+shader in the terminal.
+
+Requirements: Python 3.8+, numpy and ffmpeg, on macOS or Linux. For sound,
+install sounddevice (pip install sounddevice), which also keeps the picture
+in step with the sound most closely. Without it, gloam falls back to
+ffmpeg's macOS audio output, ffplay, paplay, pw-cat, aplay or SoX's play.
+Installing certifi lets it read song titles from https streams on Python
+builds that lack system certificates.
+
+    python3 gloam.py https://ice1.somafm.com/groovesalad-128-mp3
+    python3 gloam.py https://somafm.com/groovesalad.pls
+    python3 gloam.py song.flac other.mp3     several sources: n / b to move between them
+    python3 gloam.py stations.m3u            a playlist of stations or files
+    python3 gloam.py URL --palette ember --hold
+    python3 gloam.py URL --react wild        off, subtle, gentle, normal (default), lively,
+                                             strong, wild, extreme, unhinged, or 0 to 10
+    python3 gloam.py URL --ahead 180         run the picture 180 ms ahead of the sound
+                                             (default 130), if it trails the beat
+    python3 gloam.py URL --volume 60
+    python3 gloam.py URL --no-sound          the picture only
+
+Display options: --full, --mini [C], --num, --chunky (cell layouts),
+--256, --nocolour, --fps, --speed, --size WxH, --hue, --brightness,
+--colour (richness, default 0.5) and --white (0 lets over-bright cells go
+white, 1 keeps their colour). See --help.
+
+Keys while it runs:
+    n / b        next / previous source
+    up / down    louder / quieter (also 0 / 9)
+    m            mute
+    r / R        react more / less
+    { / }        picture earlier / later against the sound, 10 ms a press
+    p            next palette now
+    h            hold the palette / let it change
+    + / -        turn the colours round the colour wheel
+    [ / ]        darker / brighter
+    < / >        colours move slower / faster (also , / .)
+    i            show where the sound is going
+    q            quit (Ctrl-C works too)
+"""
+import argparse
+import collections
+import http.client
+import math
+import os
+import queue
+import random
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("gloam needs numpy: pip install numpy")
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+
+ESC = "\x1b"
+HALF = "▀"
+RAMP = " .:-=+*#%@"
+I = 0.00012
+STEP = 4 * math.pi / 210
+SITE_FPS = 8
+CYCLE = 4 * math.pi
+CHANGE_EVERY = 5.0
+SWEEP = 4.5
+
+RATE = 44100
+CHUNK = 1024
+BLOCK = CHUNK * 4
+PREBUF = int(0.5 * RATE / CHUNK)
+FFT_N = 2048
+NBANDS = 24
+REACT_LEVELS = ((0.0, "off"), (0.5, "subtle"), (1.0, "gentle"), (1.6, "normal"), (2.4, "lively"),
+                (3.5, "strong"), (5.0, "wild"), (7.0, "extreme"), (10.0, "unhinged"))
+REACT_DEFAULT = 1.6
+PIPE_LEAD = 0.3
+AHEAD = 0.13
+__version__ = "1.0"
+UA = f"gloam/{__version__}"
+try:
+    import certifi
+    import ssl
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    SSL_CONTEXT = None
+
+PALETTES = {
+    "powder": (1.4, 2.0, 4.2), "ember": (4.4, 1.2, 1.4), "periwinkle": (1.6, 3.6, 1.8),
+    "ice": (3.2, 2.8, 4.0), "frost": (1.2, 3.8, 3.6), "orchid": (2.6, 4.4, 1.8),
+    "lavender": (2.0, 1.4, 3.8), "wisteria": (3.4, 3.6, 1.4), "dusk": (1.8, 4.0, 2.4),
+    "slate": (2.8, 1.2, 2.6), "copper": (4.2, 2.8, 1.2), "mist": (1.4, 2.6, 3.2),
+    "steel": (2.4, 3.4, 4.2), "aurora": (1.2, 2.2, 4.4), "mineral": (2.2, 4.2, 2.8),
+    "chalk": (3.0, 1.8, 4.4), "vine": (1.8, 4.0, 3.2), "moth": (3.8, 3.0, 2.2),
+}
+NAMES = list(PALETTES)
+
+LAYOUTS = {"half": (1, 1), "full": (2, 2), "mini": (1, 2), "num": (3, 2), "chunky": (4, 4)}
+
+PCM = ["-f", "s16le", "-ar", str(RATE)]
+PLAYERS = [
+    *([["ffmpeg", "-loglevel", "quiet", *PCM, "-ch_layout", "stereo", "-i", "-", "-f", "audiotoolbox", "-"],
+       ["ffmpeg", "-loglevel", "quiet", *PCM, "-ac", "2", "-i", "-", "-f", "audiotoolbox", "-"]]
+      if sys.platform == "darwin" else []),
+    ["ffplay", "-nodisp", "-loglevel", "quiet", "-fflags", "nobuffer", "-probesize", "32",
+     *PCM, "-ch_layout", "stereo", "-i", "-"],
+    ["ffplay", "-nodisp", "-loglevel", "quiet", "-fflags", "nobuffer", "-probesize", "32",
+     *PCM, "-ac", "2", "-i", "-"],
+    ["paplay", "--raw", "--format=s16le", f"--rate={RATE}", "--channels=2"],
+    ["pw-cat", "--playback", "--format=s16", f"--rate={RATE}", "--channels=2", "-"],
+    ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c", "2"],
+    ["play", "-q", "-t", "raw", "-r", str(RATE), "-e", "signed", "-b", "16", "-c", "2", "-"],
+]
+
+
+def hue_matrix(degrees):
+    a = math.radians(degrees)
+    c, s = math.cos(a), math.sin(a)
+    return (
+        (0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928),
+        (0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283),
+        (0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072),
+    )
+
+
+class Field:
+
+    def __init__(self, w, h, cw, ch, sat=0.5, keep_hue=0.0):
+        self.w, self.h = w, h
+        self.sat = sat
+        self.keep_hue = keep_hue
+        rx = 1600.0
+        ry_rx = (h * ch) / (w * cw)
+        off = 0.1 / I / 250 / 512
+        uy = ((h - np.arange(h) - 0.5) * 2 / h - 1) * ry_rx
+        ux = (np.arange(w) + 0.5) * 2 / w - 1
+        ux, uy = np.meshgrid(ux, uy)
+        self.r = np.hypot(ux, uy)
+        self.squash = np.cos(2 * np.arctan2(uy, ux))
+        self.dark = self.darkening(self.r)
+        self.phase = np.hypot(ux + off * rx, uy + off * rx * ry_rx) + math.sin(I)
+        lo, hi = self.dark.min(), self.dark.max()
+        self.mid = (self.dark - lo) / (hi - lo or 1)
+
+    @staticmethod
+    def darkening(r):
+        d = 0.4 / np.cos(np.sin(r))
+        return (np.sin(d * 0.9981 + I * 0.5) / 0.833) ** 2
+
+    def bent(self, shape):
+        size, squash, channels = shape
+        r = self.r / (size * np.exp(squash * self.squash))
+        return np.stack([self.darkening(r / k) for k in channels], -1)
+
+    def colours(self, t, pal, new, sweep, hue, bright, shape=None):
+        ph = self.phase + t
+        dark = self.dark if shape is None else self.bent(shape)
+        c = self._shade(PALETTES[pal], ph, dark)
+        if new is not None:
+            mix = np.clip((sweep * 1.25 - self.mid) / 0.25, 0, 1)[..., None]
+            c = c * (1 - mix) + self._shade(PALETTES[new], ph, dark) * mix
+        if hue % 360:
+            c = c @ np.array(hue_matrix(hue)).T
+        c = np.clip(c * (255 * bright / 100) + 0.5, 0, 255).astype(np.uint8)
+        return [list(map(tuple, row)) for row in c.tolist()], ((ph % CYCLE) * 100 / CYCLE).astype(int).tolist()
+
+    def _shade(self, par, ph, dark):
+        s32, s25 = np.sin(3.2 + ph), np.sin(2.5 + ph)
+        c = np.stack((par[0] + s32 * np.cos(ph * 1.5), par[1] + s25 * np.sin(ph * 1.5), par[2] + s25 * np.cos(ph * 3.5)), -1)
+        c = c * (dark if dark.ndim == 3 else dark[..., None])
+        clipped = np.clip(c, 0, 1)
+        if self.keep_hue:
+            scaled = np.clip(c / np.maximum(c.max(-1), 1)[..., None], 0, 1)
+            clipped = clipped + (scaled - clipped) * self.keep_hue
+        c = clipped
+        y = c @ np.array((0.2126, 0.7152, 0.0722))
+        c = np.clip(y[..., None] + (c - y[..., None]) * self.sat, 0, 1)
+        return 0.9 * c + 0.0102
+
+
+def cube(c):
+    r, g, b = (int(x * 5 / 255 + 0.5) for x in c)
+    return 16 + 36 * r + 6 * g + b
+
+
+def code(c, mode, ground):
+    if mode == "24bit":
+        return f"{ESC}[{ground};2;{c[0]};{c[1]};{c[2]}m"
+    return f"{ESC}[{ground};5;{cube(c)}m"
+
+
+def render(rows, nums, mode, layout, mini_char, status, cols):
+    out = [ESC + "[H"]
+    cw, ch = LAYOUTS[layout]
+    reps = ch // 2 if layout != "half" else 1
+    if mode == "ascii":
+        for row, nrow in zip(rows, nums):
+            if layout == "num":
+                line = "".join(f"{n:>{cw}}" for n in nrow)
+            else:
+                line = "".join(RAMP[min(9, sum(c) // 77)] * cw for c in row)
+            for _ in range(reps):
+                out.append(line + "\r\n")
+    elif layout == "half":
+        if len(rows) % 2:
+            rows.append(rows[-1])
+        for y in range(0, len(rows), 2):
+            fg = bg = None
+            parts = []
+            for t, b in zip(rows[y], rows[y + 1]):
+                if b != bg:
+                    parts.append(code(b, mode, 48))
+                    bg = b
+                if t == b:
+                    parts.append(" ")
+                else:
+                    if t != fg:
+                        parts.append(code(t, mode, 38))
+                        fg = t
+                    parts.append(HALF)
+            out.append("".join(parts) + ESC + "[0m\r\n")
+    else:
+        ground = 38 if layout == "num" or mini_char != " " else 48
+        for row, nrow in zip(rows, nums):
+            last = None
+            parts = []
+            for c, n in zip(row, nrow):
+                if c != last:
+                    parts.append(code(c, mode, ground))
+                    last = c
+                parts.append(f"{n:>{cw}}" if layout == "num" else mini_char * cw)
+            line = "".join(parts) + ESC + "[0m\r\n"
+            for _ in range(reps):
+                out.append(line)
+    out.append(ESC + "[0m" + ESC + "[2m" + status[:cols] + ESC + "[0m" + ESC + "[K")
+    return "".join(out)
+
+
+class Analyser:
+
+    def __init__(self):
+        self.win = np.hanning(FFT_N).astype(np.float32)
+        freqs = np.fft.rfftfreq(FFT_N, 1 / RATE)
+        edges = np.geomspace(40, 16000, NBANDS + 1)
+        self.bins = []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            b = np.where((freqs >= lo) & (freqs < hi))[0]
+            self.bins.append(b if len(b) else np.array([np.argmin(abs(freqs - (lo + hi) / 2))]))
+        self.peak = np.full(NBANDS, 1.0)
+        self.bands = np.zeros(NBANDS)
+        self.target = self.flux = np.zeros(NBANDS)
+        self.lpeak, self.loud = 0.02, 0.0
+        self.bass_avg, self.prev_bass, self.last_beat = 0.0, 0.0, 0.0
+
+    def update(self, x, dt, now):
+        mag = np.abs(np.fft.rfft(x * self.win))
+        raw = np.array([mag[b].mean() for b in self.bins])
+        self.peak = np.maximum.reduce([self.peak * math.exp(-dt / 6), raw,
+                                       np.full(NBANDS, max(0.2, 0.004 * self.peak.max()))])
+        target = np.clip(raw / self.peak, 0, 1) ** 1.5
+        self.flux = np.maximum(0, target - self.target)
+        self.target = target
+        self.bands = np.maximum(target, self.bands * math.exp(-dt / 0.25))
+
+        rms = float(np.sqrt(np.mean(x * x)))
+        self.lpeak = max(self.lpeak * math.exp(-dt / 10), rms, 0.02)
+        self.loud = min(1.0, rms / self.lpeak) ** 1.5
+
+        bass = float(raw[:4].sum())
+        beat = (bass > self.bass_avg * 1.5 and bass > self.prev_bass and
+                self.bands[:4].mean() > 0.3 and now - self.last_beat > 0.28)
+        if beat:
+            self.last_beat = now
+        self.bass_avg += (bass - self.bass_avg) * min(1.0, dt / 0.8)
+        self.prev_bass = bass
+        return beat
+
+
+def ease(x, target, dt, tau):
+    return x + (target - x) * (1 - np.exp(-dt / tau))
+
+
+def follow(x, target, dt, rise, fall):
+    return ease(x, target, dt, np.where(target > x, rise, fall))
+
+
+class Spring:
+
+    def __init__(self, hz, damping):
+        self.x = self.v = 0.0
+        self.w, self.z = 2 * math.pi * hz, damping
+
+    def update(self, target, dt):
+        steps = max(1, int(dt / 0.01) + 1)
+        h = dt / steps
+        for _ in range(steps):
+            self.v += (self.w * self.w * (target - self.x) - 2 * self.z * self.w * self.v) * h
+            self.x += self.v * h
+        return self.x
+
+
+class Reaction:
+
+    SQUASH = (4, 15)
+    CHANNELS = ((0, 6), (6, 15), (15, 24))
+
+    def __init__(self):
+        self.bands = np.zeros(NBANDS)
+        self.level, self.pace = 0.0, 1.0
+        self.size = Spring(3.5, 0.35)
+        self.squash = Spring(2.4, 0.35)
+        self.channels = [Spring(3.0, 0.35) for _ in self.CHANNELS]
+        self.drift = np.zeros(2 + len(self.CHANNELS))
+
+    def update(self, an, beat, dt, react):
+        self.bands = follow(self.bands, an.bands, dt, 0.03, 0.18)
+        self.level = float(follow(self.level, an.loud, dt, 0.05, 0.4))
+        if not react:
+            self.pace = ease(self.pace, 1.0, dt, 0.5)
+            return self.pace, None
+        self.pace = ease(self.pace, 0.6 + 0.9 * min(react, 2.5) * self.level, dt, 0.3)
+        self.size.v += react * (7.0 * float(an.flux[:4].mean()) + (3.5 if beat else 0.0))
+        sway = [self.size.update(0.3 * react * float(self.bands[:4].mean()), dt)]
+        lo, hi = self.SQUASH
+        self.squash.v += react * 4.0 * float(an.flux[lo:hi].mean())
+        sway.append(self.squash.update(0.3 * react * float(self.bands[lo:hi].mean()), dt))
+        for spring, (lo, hi) in zip(self.channels, self.CHANNELS):
+            spring.v += react * 8.0 * float(an.flux[lo:hi].mean())
+            sway.append(spring.update(0.25 * react * float(self.bands[lo:hi].mean()), dt))
+        sway = np.array(sway)
+        self.drift = ease(self.drift, sway, dt, 2.5)
+        sway = sway - self.drift
+        lim = 0.5 + 0.12 * react
+        squash = lim * math.tanh(sway[1] / lim)
+        channels = [math.exp(lim * math.tanh(x / lim)) for x in sway[2:]]
+        size = math.exp(1.5 * lim * math.tanh(sway[0] / (1.5 * lim)))
+        return self.pace, (size, squash, channels)
+
+
+def is_url(s):
+    return re.match(r"(?i)^(https?|icy)://", s) is not None
+
+
+def playlist_entries(text, base):
+    if "#EXT-X-" in text:
+        return None
+    out = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("﻿")
+        m = re.match(r"(?i)^file\d+\s*=\s*(.+)$", line)
+        if m:
+            line = m.group(1).strip()
+        elif not line or line.startswith(("#", "[")) or "=" in line and not is_url(line):
+            continue
+        if is_url(line):
+            out.append(line)
+        elif is_url(base):
+            out.append(urllib.parse.urljoin(base, line))
+        else:
+            out.append(os.path.join(os.path.dirname(base), os.path.expanduser(line)))
+    return out
+
+
+def expand(sources):
+    out = []
+    for s in sources:
+        if not is_url(s) and os.path.isfile(s) and s.lower().endswith((".pls", ".m3u", ".m3u8")):
+            with open(s, encoding="utf-8", errors="replace") as f:
+                entries = playlist_entries(f.read(), s)
+            out.extend([s] if entries is None else entries)
+        else:
+            out.append(s)
+    return out
+
+
+def short_name(src):
+    if is_url(src):
+        u = urllib.parse.urlparse(src)
+        return (u.netloc + u.path).rstrip("/")
+    return os.path.basename(src)
+
+
+def decode(b):
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("latin-1")
+
+
+class Player:
+
+    def __init__(self, sound, latency=None):
+        self.lock = threading.Lock()
+        self.wlock = threading.Lock()
+        self.ring = np.zeros(FFT_N, np.float32)
+        self.fed_at = 0.0
+        self.q = queue.Queue(maxsize=int(3 * RATE / CHUNK))
+        self.delay = collections.deque()
+        self.held = collections.deque()
+        self.ahead = AHEAD
+        self.out_peak, self.underruns = 0.0, 0
+        self.pipe_t = 0.0
+        self.gen = 0
+        self.proc = None
+        self.vol, self.muted = 1.0, False
+        self.kind, self.out, self.latency = "none", None, 0.0
+        self.reset()
+        self.eof = True
+        if sound:
+            self._open(latency)
+
+    def reset(self):
+        self.title = self.name = self.tag_title = self.tag_artist = ""
+        self.state, self.chunks, self.eof, self.buffering = "connecting", 0, False, True
+
+    def _open(self, latency):
+        if sd is not None:
+            try:
+                self.out = sd.OutputStream(samplerate=RATE, channels=2, dtype="int16",
+                                           blocksize=CHUNK, callback=self._callback)
+                self.out.start()
+                self.kind = "sound card"
+                self.latency = self.out.latency if latency is None else latency
+                return
+            except Exception:
+                self.out = None
+        for cmd in PLAYERS:
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            except OSError:
+                continue
+            time.sleep(0.3)
+            if p.poll() is None:
+                self.out, self.kind = p, "ffmpeg (Core Audio)" if "audiotoolbox" in cmd else cmd[0]
+                self.latency = PIPE_LEAD + 0.15 if latency is None else latency
+                return
+        raise RuntimeError("found no way to play sound: pip install sounddevice, or install "
+                           "ffplay (it comes with ffmpeg), or run with --no-sound")
+
+    def close(self):
+        self.stop()
+        if self.kind == "sound card":
+            self.out.stop()
+            self.out.close()
+        elif self.out is not None:
+            try:
+                self.out.stdin.close()
+            except OSError:
+                pass
+            self.out.terminate()
+
+    def _offset(self):
+        if self.kind == "none":
+            return 0, 0
+        net = round((self.latency - self.ahead) * RATE / CHUNK)
+        return max(0, net), max(0, -net)
+
+    def _hold(self, a):
+        self.held.append(a)
+        keep = self._offset()[1]
+        while len(self.held) > keep + 1:
+            self.held.popleft()
+        if len(self.held) > keep:
+            return self.held.popleft()
+        return np.zeros_like(a)
+
+    def _heard(self, a):
+        self.delay.append(a)
+        keep = self._offset()[0]
+        while len(self.delay) > keep:
+            m = self.delay.popleft().mean(axis=1, dtype=np.float32) / 32768
+            with self.lock:
+                self.ring = np.concatenate((self.ring[len(m):], m))
+                self.fed_at = time.monotonic()
+
+    def samples(self):
+        with self.lock:
+            if time.monotonic() - self.fed_at > 0.3:
+                return np.zeros(FFT_N, np.float32)
+            return self.ring.copy()
+
+    def _scaled(self, a):
+        if self.muted:
+            a = np.zeros_like(a)
+        elif self.vol != 1.0:
+            a = np.clip(a * self.vol, -32768, 32767).astype(np.int16)
+        self.out_peak = max(self.out_peak * 0.9, float(np.abs(a).max()) / 32768)
+        return a
+
+    def info(self):
+        route = {"sound card": "sounddevice", "none": "none (--no-sound)"}.get(self.kind, self.kind)
+        out = f" sound: {route}"
+        if self.kind != "none":
+            out += f", speakers {self.latency * 1000:.0f}ms, picture ahead {self.ahead * 1000:.0f}ms"
+            out += f", level going out {self.out_peak * 100:.0f}%"
+            if self.kind == "sound card":
+                out += f", buffered {self.q.qsize() * CHUNK / RATE:.1f}s, gaps {self.underruns}"
+            if self.muted:
+                out += ", MUTED"
+        return out + f"  [{self.state}]"
+
+    def _callback(self, outdata, frames, time_info, status):
+        if self.buffering and not self.eof and self.q.qsize() < PREBUF:
+            outdata.fill(0)
+            return
+        try:
+            a = self.q.get_nowait()
+        except queue.Empty:
+            outdata.fill(0)
+            if not self.buffering:
+                self.underruns += 1
+            self.buffering = True
+            return
+        self.buffering = False
+        self._heard(a)
+        outdata[:] = self._scaled(self._hold(a))
+
+    def finished(self):
+        return self.eof and (self.kind != "sound card" or self.q.empty())
+
+    def display_title(self):
+        title = self.title
+        if not title and self.tag_title:
+            title = f"{self.tag_artist} - {self.tag_title}" if self.tag_artist else self.tag_title
+        if self.name and title:
+            return f"{self.name}: {title}"
+        return title or self.name
+
+    def stop(self):
+        self.gen += 1
+        p, self.proc = self.proc, None
+        if p is not None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        while True:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+        self.delay.clear()
+        self.held.clear()
+
+    def play(self, src):
+        self.stop()
+        self.reset()
+        threading.Thread(target=self._run, args=(self.gen, src), daemon=True).start()
+
+    def _run(self, gen, src):
+        try:
+            self._decode(gen, src)
+        except Exception as e:
+            if gen == self.gen:
+                msg = getattr(e, "reason", None) or e
+                self.state = f"couldn't play: {msg}"
+                self.eof = True
+
+    def _connect(self, src):
+        src = re.sub(r"(?i)^icy://", "http://", src)
+        for _ in range(4):
+            req = urllib.request.Request(src, headers={"Icy-MetaData": "1", "User-Agent": UA})
+            try:
+                resp = urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT)
+            except urllib.error.HTTPError:
+                raise
+            except (http.client.HTTPException, urllib.error.URLError, OSError):
+                return None, src
+            ctype = resp.headers.get("Content-Type", "").lower()
+            path = urllib.parse.urlparse(resp.geturl()).path.lower()
+            if "mpegurl" in ctype or "scpls" in ctype or path.endswith((".pls", ".m3u", ".m3u8")):
+                text = decode(resp.read(1 << 16))
+                resp.close()
+                entries = playlist_entries(text, resp.geturl())
+                if entries is None:
+                    return None, src
+                if not entries:
+                    raise RuntimeError("the playlist is empty")
+                src = entries[0]
+                continue
+            return resp, src
+        raise RuntimeError("playlists nested too deep")
+
+    def _decode(self, gen, src):
+        resp = None
+        if is_url(src):
+            resp, src = self._connect(src)
+            if resp is not None:
+                self.name = resp.headers.get("icy-name", "").strip()
+        if gen != self.gen:
+            if resp is not None:
+                resp.close()
+            return
+        cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info"]
+        if resp is None and src.lower().startswith("http"):
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        if resp is None:
+            cmd.insert(1, "-nostdin")
+        cmd += ["-i", "pipe:0" if resp is not None else src, "-vn", "-map", "0:a:0",
+                "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2", "-ar", str(RATE), "pipe:1"]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if resp is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = proc
+        if gen != self.gen:
+            proc.kill()
+        tail = collections.deque(maxlen=6)
+        err = threading.Thread(target=self._stderr, args=(gen, proc.stderr, tail), daemon=True)
+        err.start()
+        if resp is not None:
+            threading.Thread(target=self._pump, args=(gen, resp, proc.stdin), daemon=True).start()
+        next_t = time.monotonic()
+        while gen == self.gen:
+            data = proc.stdout.read(BLOCK)
+            if not data:
+                break
+            if len(data) < BLOCK:
+                data += bytes(BLOCK - len(data))
+            a = np.frombuffer(data, "<i2").reshape(-1, 2)
+            self.chunks += 1
+            self.state = "playing"
+            if self.kind == "sound card":
+                while gen == self.gen:
+                    try:
+                        self.q.put(a, timeout=0.2)
+                        break
+                    except queue.Full:
+                        pass
+            elif self.out is not None:
+                now = time.monotonic()
+                self.pipe_t = max(self.pipe_t, now) + CHUNK / RATE
+                if self.pipe_t - now > PIPE_LEAD:
+                    time.sleep(self.pipe_t - now - PIPE_LEAD)
+                with self.wlock:
+                    if gen != self.gen:
+                        break
+                    try:
+                        self.out.stdin.write(self._scaled(self._hold(a)).tobytes())
+                    except (BrokenPipeError, ValueError):
+                        self.state = f"{self.kind} stopped playing"
+                        break
+                self._heard(a)
+            else:
+                now = time.monotonic()
+                if next_t > now:
+                    time.sleep(next_t - now)
+                next_t = max(next_t + CHUNK / RATE, now - 0.5)
+                self._heard(a)
+        proc.wait()
+        err.join(1)
+        if gen == self.gen:
+            if not self.chunks:
+                lines = [l for l in tail if l]
+                self.state = "couldn't play: " + (lines[-1] if lines else f"ffmpeg exited {proc.returncode}")
+            elif self.state == "playing":
+                self.state = "ended"
+            self.eof = True
+
+    def _stderr(self, gen, f, tail):
+        for raw in iter(f.readline, b""):
+            if gen != self.gen:
+                continue
+            line = decode(raw).strip()
+            tail.append(line)
+            m = re.match(r"(?i)(StreamTitle|icy-name|title|artist)\s*:\s*(.*)$", line)
+            if not m:
+                continue
+            key, val = m.group(1).lower(), m.group(2).strip()
+            if key == "streamtitle":
+                self.title = val
+            elif key == "icy-name":
+                self.name = self.name or val
+            elif key == "title":
+                self.tag_title = self.tag_title or val
+            elif key == "artist":
+                self.tag_artist = self.tag_artist or val
+
+    def _pump(self, gen, resp, stdin):
+        metaint = int(resp.headers.get("icy-metaint") or 0)
+        try:
+            while gen == self.gen:
+                data = resp.read(metaint or 16384)
+                if not data:
+                    break
+                stdin.write(data)
+                if metaint:
+                    n = resp.read(1)
+                    if not n:
+                        break
+                    if n[0]:
+                        m = re.search(rb"StreamTitle='(.*?)';", resp.read(n[0] * 16), re.S)
+                        if m and gen == self.gen:
+                            self.title = decode(m.group(1)).strip()
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+        finally:
+            for f in (stdin, resp):
+                try:
+                    f.close()
+                except OSError:
+                    pass
+
+
+ARROWS = {"A": "0", "B": "9"}
+
+
+class Keys:
+
+    SEQ = re.compile(r"\x1b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+    PART = re.compile(r"\x1b(?:\[[0-9;]*|O)?$")
+
+    def __init__(self):
+        self.pending, self.since = "", 0.0
+
+    def feed(self, data, now):
+        data = self.pending + data
+        self.pending = ""
+        out, i = [], 0
+        while i < len(data):
+            if data[i] != "\x1b":
+                out.append(data[i])
+                i += 1
+                continue
+            m = self.SEQ.match(data, i)
+            if m:
+                if m.group()[-1] in ARROWS:
+                    out.append(ARROWS[m.group()[-1]])
+                i = m.end()
+            elif self.PART.match(data, i):
+                self.pending, self.since = data[i:], now
+                break
+            else:
+                i += 1
+        return out
+
+    def waiting(self, now):
+        if self.pending and now - self.since > 0.15:
+            self.pending = ""
+        return bool(self.pending)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="gloam", description="An internet radio and music player for the terminal, "
+                                 "with a visualiser based on the lpx.org.uk background.")
+    ap.add_argument("--version", action="version", version=f"gloam {__version__}")
+    ap.add_argument("sources", nargs="+", metavar="URL_OR_FILE", help="streams, files or playlists")
+    ap.add_argument("--palette", choices=NAMES, help="palette to start on (default random)")
+    ap.add_argument("--hold", action="store_true", help="stay on the palette")
+    ap.add_argument("--react", default=str(REACT_DEFAULT), metavar="LEVEL",
+                    help="how much it reacts: a number 0 to 10, or " + ", ".join(n for _, n in REACT_LEVELS))
+    ap.add_argument("--ahead", type=float, default=AHEAD * 1000, metavar="MS",
+                    help=f"how far the picture runs ahead of the sound (default {AHEAD * 1000:.0f})")
+    ap.add_argument("--volume", type=int, default=100, help="percent, 0 to 200")
+    ap.add_argument("--colour", type=float, default=0.5, help="how rich the colours are: 0.5 is the site's")
+    ap.add_argument("--white", type=float, default=0.5, help="0 lets bright cells go white as on the site, 1 keeps their colour")
+    ap.add_argument("--no-sound", action="store_true", help="show the picture without playing the sound")
+    ap.add_argument("--latency", type=float, metavar="MS",
+                    help="your sound output's latency, if gloam's estimate is off")
+    ap.add_argument("--full", action="store_true", help="whole-character cells, two columns each")
+    ap.add_argument("--mini", nargs="?", const=" ", metavar="C", help="whole characters, one column a cell, optionally drawn as C")
+    ap.add_argument("--num", action="store_true", help="each cell's place in the colour cycle, 0-99")
+    ap.add_argument("--chunky", action="store_true", help="big cells, four columns by two rows")
+    ap.add_argument("--256", dest="c256", action="store_true", help="256 colours")
+    ap.add_argument("--nocolour", "--nocolor", action="store_true", help="ASCII")
+    ap.add_argument("--fps", type=float, default=30.0, help="frames per second (default 30)")
+    ap.add_argument("--speed", type=float, default=1.0, help="times the site's speed")
+    ap.add_argument("--size", metavar="WxH", help="fixed size in characters")
+    ap.add_argument("--hue", type=float, default=0.0, help="turn the colours this many degrees")
+    ap.add_argument("--brightness", type=int, default=100, help="percent, 20 to 200")
+    a = ap.parse_args()
+
+    if not shutil.which("ffmpeg"):
+        sys.exit("gloam needs ffmpeg (brew install ffmpeg, apt install ffmpeg, ...)")
+    sources = expand(a.sources)
+    if not sources:
+        sys.exit("nothing to play")
+    mode = "ascii" if a.nocolour else "256" if a.c256 else "24bit"
+    mini_char = (a.mini or " ")[:1]
+    layout = ("num" if a.num else "chunky" if a.chunky else "mini" if a.mini is not None
+              else "full" if a.full or mode == "ascii" else "half")
+    fixed = None
+    if a.size:
+        try:
+            fixed = tuple(max(4, int(n)) for n in a.size.lower().split("x"))
+        except ValueError:
+            sys.exit("--size wants WxH, like 60x20")
+    pal = a.palette or random.choice(NAMES)
+    hold, hue, speed = a.hold, a.hue % 360, max(0.1, a.speed)
+    bright = max(20, min(200, a.brightness))
+    names = {n: v for v, n in REACT_LEVELS}
+    try:
+        react = names[a.react] if a.react in names else max(0.0, min(10.0, float(a.react)))
+    except ValueError:
+        sys.exit("--react wants a number from 0 to 10, or one of: " + ", ".join(names))
+    sat = max(0.0, min(1.5, a.colour))
+    keep_hue = 1 - max(0.0, min(1.0, a.white))
+
+    fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        sys.exit("gloam needs a terminal")
+    try:
+        player = Player(not a.no_sound, None if a.latency is None else a.latency / 1000)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    player.vol = max(0, min(200, a.volume)) / 100
+    player.ahead = max(0.0, min(1.0, a.ahead / 1000))
+    analyser = Analyser()
+    idx = 0
+    player.play(sources[idx])
+    goodbye = None
+
+    saved = termios.tcgetattr(fd)
+    out = open(sys.stdout.fileno(), "w", encoding="utf-8", closefd=False)
+    try:
+        tty.setcbreak(fd)
+        out.write(ESC + "[?1049h" + ESC + "[?25l" + ESC + "[2J")
+        out.flush()
+        field, size = None, None
+        tick = 1.0 / a.fps
+        nxt = last = time.monotonic()
+        t = 0.0
+        reaction = Reaction()
+        new, sweep = None, 0.0
+        change_at = time.monotonic() + CHANGE_EVERY
+        note, note_until = "", 0.0
+        reader = Keys()
+        info_until = time.monotonic() + 6
+        retry_at = None
+        while True:
+            cols, rows = fixed or os.get_terminal_size()
+            if (cols, rows) != size:
+                size = (cols, rows)
+                cw, ch = LAYOUTS[layout]
+                field = Field(max(1, cols // cw), max(1, (rows - 1) * 2 // ch), cw, ch, sat, keep_hue)
+                out.write(ESC + "[2J")
+            while True:
+                left = nxt - time.monotonic()
+                if reader.waiting(time.monotonic()):
+                    left = min(left, 0.02)
+                r, _, _ = select.select([fd], [], [], max(0.0, left))
+                if r:
+                    for k in reader.feed(os.read(fd, 1024).decode("latin-1"), time.monotonic()):
+                        if k == "q":
+                            return
+                        if k in "nb":
+                            idx = (idx + (1 if k == "n" else -1)) % len(sources)
+                            retry_at = None
+                            player.play(sources[idx])
+                            continue
+                        if k == "p":
+                            if new is None:
+                                new, sweep = NAMES[(NAMES.index(pal) + 1) % len(NAMES)], 0.0
+                            else:
+                                pal, sweep = new, 1.0
+                        elif k == "h":
+                            hold = not hold
+                            change_at = time.monotonic() + CHANGE_EVERY
+                        elif k in "+=-_":
+                            hue = (hue + (15 if k in "+=" else -15)) % 360
+                        elif k in "[]":
+                            bright = max(20, min(200, bright + (10 if k == "]" else -10)))
+                        elif k in "<>,.":
+                            speed = max(0.1, min(10.0, speed * (1.25 if k in ">." else 0.8)))
+                        elif k in "90":
+                            player.vol = max(0.0, min(2.0, round(player.vol + (0.05 if k == "0" else -0.05), 2)))
+                            player.muted = False
+                        elif k == "m":
+                            player.muted = not player.muted
+                        elif k in "rR":
+                            levels = [v for v, _ in REACT_LEVELS]
+                            if k == "r":
+                                react = min([v for v in levels if v > react + 1e-9] or [levels[-1]])
+                            else:
+                                react = max([v for v in levels if v < react - 1e-9] or [levels[0]])
+                        elif k == "i":
+                            info_until = time.monotonic() + 6
+                            continue
+                        elif k in "{}":
+                            player.ahead = max(0.0, min(1.0, player.ahead + (0.01 if k == "}" else -0.01)))
+                        else:
+                            continue
+                        vol = "muted" if player.muted else f"volume {int(player.vol * 100 + 0.5)}%"
+                        note = (f" {vol}  reacting {dict(REACT_LEVELS).get(react, f'{react:.2g}')}  ahead {player.ahead * 1000:.0f}ms  palette {new or pal}"
+                                f"{' (held)' if hold else ''}  hue {int(hue)}  brightness {bright}%  colour speed {speed:.2g}x")
+                        note_until = time.monotonic() + 2.5
+                if left <= 0:
+                    break
+            now = time.monotonic()
+            dt, last = min(0.25, now - last), now
+            nxt = max(nxt + tick, now - tick)
+
+            src = sources[idx]
+            if retry_at is None and player.finished():
+                if is_url(src):
+                    retry_at = now + (3 if player.chunks else 10)
+                elif idx + 1 < len(sources):
+                    idx += 1
+                    player.play(sources[idx])
+                else:
+                    if not player.chunks:
+                        goodbye = f"{short_name(src)}: {player.state}"
+                    return
+            elif retry_at is not None and now >= retry_at:
+                retry_at = None
+                player.play(src)
+
+            beat = analyser.update(player.samples(), dt, now)
+            pace, shape = reaction.update(analyser, beat, dt, react)
+
+            t += STEP * SITE_FPS * dt * speed * pace
+            if new is not None:
+                sweep += dt / SWEEP
+                if sweep >= 1:
+                    pal, new = new, None
+                    change_at = now + CHANGE_EVERY
+            elif not hold and now >= change_at:
+                new, sweep = NAMES[(NAMES.index(pal) + 1) % len(NAMES)], 0.0
+            colours, nums = field.colours(t, pal, new, sweep, hue, bright, shape)
+
+            if now < note_until:
+                status = note
+            elif now < info_until:
+                status = player.info()
+            else:
+                label = f"[{idx + 1}/{len(sources)}] " if len(sources) > 1 else ""
+                if player.state == "playing":
+                    status = f" ♪ {label}{player.display_title() or short_name(src)}"
+                    if player.muted:
+                        status += "  (muted)"
+                else:
+                    status = f" {label}{short_name(src)}  {player.state}"
+                    if retry_at is not None:
+                        status += f"  (trying again in {int(retry_at - now) + 1}s)"
+            out.write(render(colours, nums, mode, layout, mini_char, status, cols))
+            out.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        player.close()
+        out.write(ESC + "[0m" + ESC + "[?25h" + ESC + "[?1049l")
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        if goodbye:
+            print(goodbye, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
