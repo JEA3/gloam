@@ -131,6 +131,53 @@ PLAYERS = [
 ]
 
 
+# Keep the region decision separate so more English variants can be added later.
+# Only recognize named US IANA time zones, not shared UTC offsets.
+US_TIMEZONES = frozenset({
+    "America/New_York", "America/Detroit", "America/Kentucky/Louisville",
+    "America/Kentucky/Monticello", "America/Indiana/Indianapolis",
+    "America/Indiana/Marengo", "America/Indiana/Petersburg",
+    "America/Indiana/Vevay", "America/Indiana/Vincennes",
+    "America/Indiana/Winamac", "America/Chicago", "America/Indiana/Knox",
+    "America/Indiana/Tell_City", "America/Menominee",
+    "America/North_Dakota/Beulah", "America/North_Dakota/Center",
+    "America/North_Dakota/New_Salem", "America/Denver", "America/Boise",
+    "America/Phoenix", "America/Los_Angeles", "America/Anchorage",
+    "America/Juneau", "America/Sitka", "America/Metlakatla",
+    "America/Yakutat", "America/Nome", "America/Adak", "Pacific/Honolulu",
+    "America/Puerto_Rico", "America/St_Thomas", "Pacific/Guam",
+    "Pacific/Saipan", "Pacific/Pago_Pago",
+    "US/Eastern", "US/Central", "US/Mountain", "US/Arizona",
+    "US/Pacific", "US/Alaska", "US/Aleutian", "US/Hawaii",
+    "US/East-Indiana", "US/Indiana-Starke", "US/Michigan", "US/Samoa",
+})
+
+
+def configured_timezone():
+    """Get the configured IANA zone from the process or common Unix files."""
+    zone = os.environ.get("TZ")
+    if zone:
+        return zone.lstrip(":")
+    # On Linux and macOS, /etc/localtime is often a link into zoneinfo.
+    path = os.path.realpath("/etc/localtime")
+    if "/zoneinfo/" in path:
+        return path.split("/zoneinfo/", 1)[1]
+    try:
+        with open("/etc/timezone", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def english_region():
+    """Unknown and non-US zones retain gloam's original British spelling."""
+    return "US" if configured_timezone() in US_TIMEZONES else "GB"
+
+
+def english_word(british, american, region):
+    return american if region == "US" else british
+
+
 def hue_matrix(degrees):
     a = math.radians(degrees)
     c, s = math.cos(a), math.sin(a)
@@ -760,8 +807,9 @@ class Keys:
 
 
 def main():
+    region = english_region()
     ap = argparse.ArgumentParser(prog="gloam", description="An internet radio and music player for the terminal, "
-                                 "with a visualiser based on the lpx.org.uk background.")
+                                 f"with a {english_word('visualiser', 'visualizer', region)} based on the lpx.org.uk background.")
     ap.add_argument("--version", action="version", version=f"gloam {__version__}")
     ap.add_argument("sources", nargs="+", metavar="URL_OR_FILE", help="streams, files or playlists")
     ap.add_argument("--palette", choices=NAMES, help="palette to start on (default random)")
@@ -771,21 +819,21 @@ def main():
     ap.add_argument("--ahead", type=float, default=AHEAD * 1000, metavar="MS",
                     help=f"how far the picture runs ahead of the sound (default {AHEAD * 1000:.0f})")
     ap.add_argument("--volume", type=int, default=100, help="percent, 0 to 200")
-    ap.add_argument("--colour", type=float, default=0.5, help="how rich the colours are: 0.5 is the site's")
-    ap.add_argument("--white", type=float, default=0.5, help="0 lets bright cells go white as on the site, 1 keeps their colour")
+    ap.add_argument("--colour", type=float, default=0.5, help=f"how rich the {english_word('colours', 'colors', region)} are: 0.5 is the site's")
+    ap.add_argument("--white", type=float, default=0.5, help=f"0 lets bright cells go white as on the site, 1 keeps their {english_word('colour', 'color', region)}")
     ap.add_argument("--no-sound", action="store_true", help="show the picture without playing the sound")
     ap.add_argument("--latency", type=float, metavar="MS",
                     help="your sound output's latency, if gloam's estimate is off")
     ap.add_argument("--full", action="store_true", help="whole-character cells, two columns each")
     ap.add_argument("--mini", nargs="?", const=" ", metavar="C", help="whole characters, one column a cell, optionally drawn as C")
-    ap.add_argument("--num", action="store_true", help="each cell's place in the colour cycle, 0-99")
+    ap.add_argument("--num", action="store_true", help=f"each cell's place in the {english_word('colour', 'color', region)} cycle, 0-99")
     ap.add_argument("--chunky", action="store_true", help="big cells, four columns by two rows")
-    ap.add_argument("--256", dest="c256", action="store_true", help="256 colours")
+    ap.add_argument("--256", dest="c256", action="store_true", help=f"256 {english_word('colours', 'colors', region)}")
     ap.add_argument("--nocolour", "--nocolor", action="store_true", help="ASCII")
     ap.add_argument("--fps", type=float, default=30.0, help="frames per second (default 30)")
     ap.add_argument("--speed", type=float, default=1.0, help="times the site's speed")
     ap.add_argument("--size", metavar="WxH", help="fixed size in characters")
-    ap.add_argument("--hue", type=float, default=0.0, help="turn the colours this many degrees")
+    ap.add_argument("--hue", type=float, default=0.0, help=f"turn the {english_word('colours', 'colors', region)} this many degrees")
     ap.add_argument("--brightness", type=int, default=100, help="percent, 20 to 200")
     a = ap.parse_args()
 
@@ -901,7 +949,7 @@ def main():
                             continue
                         vol = "muted" if player.muted else f"volume {int(player.vol * 100 + 0.5)}%"
                         note = (f" {vol}  reacting {dict(REACT_LEVELS).get(react, f'{react:.2g}')}  ahead {player.ahead * 1000:.0f}ms  palette {new or pal}"
-                                f"{' (held)' if hold else ''}  hue {int(hue)}  brightness {bright}%  colour speed {speed:.2g}x")
+                                f"{' (held)' if hold else ''}  hue {int(hue)}  brightness {bright}%  {english_word('colour', 'color', region)} speed {speed:.2g}x")
                         note_until = time.monotonic() + 2.5
                 if left <= 0:
                     break
